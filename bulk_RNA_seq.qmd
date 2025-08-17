@@ -1,0 +1,757 @@
+---
+title: "Bulk RNA-seq analysis of phosphatases-related genes"
+author: "Cristian Alin Cucu"
+format:
+  html:
+    self-contained: true
+    toc: true
+    number-sections: true
+    code-fold: show
+    code-tools: true
+editor: visual
+execute:
+  warning: false
+  message: false
+---
+
+```{r}
+## This analysis was developed with assistance from Claude-Sonnet 4.0 (Anthropic) AI tool for plot visual optimization and code debugging. Main workflow, data interpretation and methodology were done by the author.
+
+## ======================
+## Configuration & Setup
+## ======================
+
+# CRAN packages
+required_cran <- c(
+  "dplyr", "tibble", "tidyr", "stringr", "purrr", "here", 
+  "ggplot2", "ggrepel", "ggpubr", "patchwork",
+  "RColorBrewer", "knitr", "kableExtra", "readr"
+)
+
+# Bioconductor packages
+required_bioc <- c("TCGAbiolinks", "DESeq2", "SummarizedExperiment", "biomaRt")
+
+install_if_missing <- function(pkgs, type) {
+  missing <- pkgs[!pkgs %in% rownames(installed.packages())]
+  if (length(missing) == 0) return(invisible())
+  if (type == "cran") {
+    install.packages(missing, dependencies = TRUE)
+  } else if (type == "bioc") {
+    if (!requireNamespace("BiocManager", quietly = TRUE)) install.packages("BiocManager")
+    BiocManager::install(missing, dependencies = TRUE, ask = FALSE)
+  }
+}
+
+install_if_missing(required_cran, "cran")
+install_if_missing(required_bioc, "bioc")
+
+suppressPackageStartupMessages({
+  library(TCGAbiolinks)
+  library(DESeq2)
+  library(SummarizedExperiment)
+  library(biomaRt)
+  library(dplyr)
+  library(tibble)
+  library(tidyr)
+  library(stringr)
+  library(purrr)
+  library(here)
+  library(ggplot2)
+  library(ggrepel)
+  library(ggpubr)
+  library(patchwork)
+  library(RColorBrewer)
+  library(knitr)
+  library(kableExtra)
+  library(readr)
+})
+
+# Project paths
+data_path    <- here("data")
+results_path <- here("results")
+dir.create(data_path, recursive = TRUE, showWarnings = FALSE)
+dir.create(results_path, recursive = TRUE, showWarnings = FALSE)
+
+# Genes of interest
+genes_of_interest <- c(
+  "PPP2CA","PPP2CB",                    # Catalytic subunits
+  "PPP2R5A","PPP2R5D","STRN",           # PP2A regulatory subunits
+  "CIP2A","SET","ANP32A","ANP32B",      # PP2A-B56 inhibitors
+  "MASTL","ENSA","ARPP19",              # PP2A-B55 inhibitors
+  "LCMT1","PPME1",                      # PP2A methyl/methylesterase
+  "PPP1CA","PPP1CB",                    # PP1 catalytic subunits
+  "MRAS","SHOC2",                       # PP1 interactors
+  "SPRED1","NF1"                        # MAPK regulators
+)
+
+# Plot theme
+theme_publication <- function(base_size = 12) {
+  theme_minimal(base_size = base_size) +
+    theme(
+      plot.title = element_text(size = base_size + 2, face = "bold", hjust = 0.5),
+      plot.subtitle = element_text(size = base_size, hjust = 0.5, color = "grey50"),
+      axis.title = element_text(size = base_size),
+      legend.position = "top",
+      legend.title = element_text(face = "bold"),
+      strip.text = element_text(face = "bold"),
+      panel.grid.minor = element_blank(),
+      panel.border = element_rect(color = "grey80", fill = NA, linewidth = 0.5)
+    )
+}
+
+# Helper: robustly get a count assay
+get_counts <- function(se) {
+  cand <- c("unstranded","htseq_counts","HTSeq - Counts","counts")
+  an <- assayNames(se)
+  hit <- intersect(cand, an)
+  if (length(hit) == 0) stop("No count assay found. Available assays: ", paste(an, collapse=", "))
+  assay(se, hit[1])
+}
+
+# Helper: unique gene symbols with fallback to Ensembl IDs
+make_unique_symbols <- function(ensembl_ids_nover, mapping_tbl) {
+  syms <- mapping_tbl$hgnc_symbol[match(ensembl_ids_nover, mapping_tbl$ensembl_gene_id)]
+  fallback <- is.na(syms) | syms == ""
+  syms[fallback] <- ensembl_ids_nover[fallback]
+  make.unique(syms)
+}
+```
+
+```{r}
+## ============================
+## TCGA Download & Preparation
+## ============================
+
+download_tcga_data <- function(project_id, tumor_limit = 100) {
+  local_file <- file.path(data_path, paste0(project_id, "_data.rds"))
+  if (file.exists(local_file)) {
+    cat("Loading cached data for", project_id, "\n")
+    return(readRDS(local_file))
+  }
+  # Initial query (broad) to list samples
+  query <- GDCquery(
+    project = project_id,
+    data.category = "Transcriptome Profiling",
+    data.type = "Gene Expression Quantification",
+    workflow.type = "STAR - Counts",
+    sample.type = c("Solid Tissue Normal", "Primary Tumor")
+  )
+  results <- getResults(query)
+
+  normal_samples     <- results[results$sample_type == "Solid Tissue Normal", ]
+  tumor_samples_all  <- results[results$sample_type == "Primary Tumor", ]
+
+  cat("Taking first", min(tumor_limit, nrow(tumor_samples_all)), "tumor samples from", nrow(tumor_samples_all), "available\n")
+  tumor_samples <- head(tumor_samples_all, tumor_limit)
+
+  cat("Selected samples:", nrow(normal_samples), "normal,", nrow(tumor_samples), "tumor\n")
+
+  # IMPORTANT: use 'barcode' (not 'cases') for the limited query
+  selected_barcodes <- unique(na.omit(c(normal_samples$barcode, tumor_samples$barcode)))
+
+  query_limited <- GDCquery(
+    project = project_id,
+    data.category = "Transcriptome Profiling",
+    data.type = "Gene Expression Quantification",
+    workflow.type = "STAR - Counts",
+    barcode = selected_barcodes
+  )
+  GDCdownload(query_limited, directory = data_path)
+  se_object <- GDCprepare(query_limited, directory = data_path)
+
+  saveRDS(se_object, local_file)
+  se_object
+}
+
+# Download data
+paad_data <- download_tcga_data("TCGA-PAAD", tumor_limit = 100)
+coad_data <- download_tcga_data("TCGA-COAD", tumor_limit = 100)
+luad_data <- download_tcga_data("TCGA-LUAD", tumor_limit = 100)
+
+# Metadata processor
+process_metadata <- function(se, project_id) {
+  meta <- as.data.frame(colData(se))
+  meta$sample_id <- rownames(meta)
+  processed_meta <- meta %>%
+    mutate(
+      condition = case_when(
+        sample_type == "Primary Tumor" ~ "Tumor",
+        sample_type == "Solid Tissue Normal" ~ "Normal",
+        TRUE ~ NA_character_
+      ),
+      cancer_type = case_when(
+        project_id == "TCGA-PAAD" ~ "Pancreatic",
+        project_id == "TCGA-COAD" ~ "Colorectal",
+        project_id == "TCGA-LUAD" ~ "Lung",
+        TRUE ~ "Unknown"
+      )
+    ) %>%
+    filter(condition %in% c("Normal", "Tumor")) %>%
+    mutate(condition = factor(condition, levels = c("Normal", "Tumor")))
+
+  cat("\nSample distribution for", project_id, ":\n")
+  print(table(processed_meta$condition))
+  processed_meta
+}
+
+# Build per-cancer containers with robust assay selection
+cancer_data <- list()
+if (exists("paad_data")) {
+  cancer_data$Pancreatic <- list(counts = get_counts(paad_data),
+                                 metadata = process_metadata(paad_data, "TCGA-PAAD"))
+}
+if (exists("coad_data")) {
+  cancer_data$Colorectal <- list(counts = get_counts(coad_data),
+                                 metadata = process_metadata(coad_data, "TCGA-COAD"))
+}
+if (exists("luad_data")) {
+  cancer_data$Lung <- list(counts = get_counts(luad_data),
+                           metadata = process_metadata(luad_data, "TCGA-LUAD"))
+}
+
+# ID mapping: Ensembl → HGNC
+suppressMessages({
+  # Use Ensembl main host for stability
+  mart <- useEnsembl(biomart = "ensembl", dataset = "hsapiens_gene_ensembl")
+  all_genes <- unique(str_remove(
+    unlist(lapply(cancer_data, function(x) rownames(x$counts))),
+    "\\..*$"
+  ))
+  gene_symbols <- getBM(
+    attributes = c("ensembl_gene_id", "hgnc_symbol"),
+    filters = "ensembl_gene_id",
+    values = all_genes,
+    mart = mart
+  )
+  cat("Retrieved symbols for", nrow(gene_symbols), "genes\n")
+})
+
+# Run DESeq2 per cancer
+analyses <- purrr::map(cancer_data, function(data) {
+  cancer_type <- unique(data$metadata$cancer_type)
+  cat("Processing", cancer_type, "cancer data...\n")
+
+  common <- intersect(colnames(data$counts), data$metadata$sample_id)
+  counts <- data$counts[, common, drop = FALSE]
+  metadata <- data$metadata[match(common, data$metadata$sample_id), , drop = FALSE]
+  cat("  Samples aligned:", length(common), "\n")
+
+  dds <- DESeqDataSetFromMatrix(countData = counts, colData = metadata, design = ~ condition)
+
+  # Prefilter low-count genes
+  keep <- rowSums(counts(dds)) >= 10
+  dds <- dds[keep, ]
+  cat("  Genes after filtering:", nrow(dds), "of", length(keep), "\n")
+
+  dds$condition <- relevel(dds$condition, ref = "Normal")
+
+  ensembl_clean <- str_remove(rownames(dds), "\\..*$")
+  mcols(dds)$gene_symbol <- make_unique_symbols(ensembl_clean, gene_symbols)
+
+  dds <- DESeq(dds)
+
+  res <- results(dds, contrast = c("condition", "Tumor", "Normal"))
+  summary(res, alpha = 0.05)
+
+  list(dds = dds, metadata = metadata, results = res)
+})
+```
+
+```{r}
+## =================
+## PAAD (Pancreatic)
+## =================
+
+dds <- analyses$Pancreatic$dds
+results_df <- analyses$Pancreatic$results
+
+cat("  Total samples:", ncol(dds), "\n")
+cat("  Normal samples:", sum(dds$condition == "Normal"), "\n")
+cat("  Tumor samples:", sum(dds$condition == "Tumor"), "\n")
+cat("  Total genes:", nrow(dds), "\n")
+
+# PCA
+vsd <- vst(dds, blind = FALSE)
+pca_data <- plotPCA(vsd, intgroup = "condition", returnData = TRUE) |>
+  as_tibble() |>
+  mutate(sample_id = name, condition = factor(group))
+percent_var <- round(100 * attr(plotPCA(vsd, intgroup = "condition", returnData = TRUE), "percentVar"))
+
+pc1_test <- t.test(PC1 ~ condition, data = pca_data)
+pc2_test <- t.test(PC2 ~ condition, data = pca_data)
+cat("PCA Results:\n")
+cat("  PC1 variance explained:", percent_var[1], "%\n")
+cat("  PC2 variance explained:", percent_var[2], "%\n")
+cat("  PC1 separation p-value:", format.pval(pc1_test$p.value), "\n")
+cat("  PC2 separation p-value:", format.pval(pc2_test$p.value), "\n")
+
+pca_pancreatic <- ggplot(pca_data, aes(x = PC1, y = PC2, color = condition)) +
+  geom_point(size = 3, alpha = 0.8) +
+  stat_ellipse(aes(group = condition), type = "norm", level = 0.68, alpha = 0.3) +
+  scale_color_manual(values = c("Normal" = "steelblue", "Tumor" = "firebrick"), name = "Condition") +
+  theme_publication() +
+  labs(title = "PCA - PAAD", x = paste0("PC1 (", percent_var[1], "%)"), y = paste0("PC2 (", percent_var[2], "%)"))
+pca_pancreatic
+
+# Volcano (all)
+volcano_data <- as.data.frame(results_df) |>
+  as_tibble(rownames = "ensembl_id") |>
+  mutate(gene_symbol = mcols(dds)$gene_symbol) |>
+  filter(!is.na(padj), !is.na(log2FoldChange)) |>
+  mutate(
+    neg_log10_padj = -log10(padj),
+    is_gene_interest = gene_symbol %in% genes_of_interest,
+    significance = case_when(
+      is_gene_interest ~ "Genes of Interest",
+      padj < 0.05 & log2FoldChange >  1 ~ "Upregulated",
+      padj < 0.05 & log2FoldChange < -1 ~ "Downregulated",
+      .default = "Not significant"
+    )
+  )
+cat("Volcano plot data:", nrow(volcano_data), "genes\n")
+
+volcano_all_pancreatic <- ggplot(volcano_data, aes(x = log2FoldChange, y = neg_log10_padj)) +
+  geom_point(data = filter(volcano_data, !is_gene_interest), aes(color = significance), alpha = 0.4, size = 0.8) +
+  geom_point(data = filter(volcano_data,  is_gene_interest), color = "orange", size = 3, alpha = 0.9) +
+  scale_color_manual(values = c("Upregulated" = "firebrick", "Downregulated" = "steelblue", "Not significant" = "grey"), name = "Regulation") +
+  geom_hline(yintercept = -log10(0.05), linetype = "dashed", alpha = 0.7) +
+  geom_vline(xintercept = c(-1, 1), linetype = "dashed", alpha = 0.7) +
+  geom_text_repel(data = filter(volcano_data, is_gene_interest), aes(label = gene_symbol), size = 3, max.overlaps = 20, box.padding = 0.3) +
+  theme_publication() +
+  labs(title = "Differential expression - PAAD", x = "Log2FC (Tumor vs Normal)", y = "-Log10(padj)")
+volcano_all_pancreatic
+
+# Focused PP2A/related
+volcano_pp2a_data <- volcano_data |>
+  filter(gene_symbol %in% genes_of_interest) |>
+  mutate(
+    significance_category = ifelse(abs(log2FoldChange) > 1 & padj < 0.05, "Significant", "Not Significant"),
+    direction = case_when(
+      log2FoldChange >  1 & padj < 0.05 ~ "Upregulated",
+      log2FoldChange < -1 & padj < 0.05 ~ "Downregulated",
+      TRUE ~ "Not Significant"
+    )
+  )
+
+volcano_pp2a_pancreatic <- ggplot(volcano_pp2a_data, aes(x = log2FoldChange, y = neg_log10_padj, color = direction)) +
+  geom_point(size = 4, alpha = 0.8) +
+  scale_color_manual(values = c("Upregulated" = "firebrick", "Downregulated" = "steelblue", "Not Significant" = "grey"), name = "Status") +
+  geom_hline(yintercept = -log10(0.05), linetype = "dashed", alpha = 0.7) +
+  geom_vline(xintercept = c(-1, 1), linetype = "dashed", alpha = 0.7) +
+  geom_text_repel(aes(label = gene_symbol), size = 3.5, max.overlaps = 20) +
+  theme_publication() +
+  labs(title = "Phosphatases-related genes - PAAD", x = "Log2FC (Tumor vs Normal)", y = "-Log10(padj)")
+volcano_pp2a_pancreatic
+
+# Violin plot for significantly changed genes
+significant_genes <- volcano_pp2a_data %>%
+  dplyr::filter(abs(log2FoldChange) > 1, padj < 0.05) %>%
+  dplyr::arrange(log2FoldChange)
+if (nrow(significant_genes) > 0) {
+  print(significant_genes[, c("gene_symbol", "log2FoldChange", "padj", "direction")])
+  
+  # Get normalized counts
+  normalized_counts <- counts(dds, normalized = TRUE)
+  
+  # Extract data for significant genes
+  sig_gene_symbols <- significant_genes$gene_symbol
+  gene_indices <- which(mcols(dds)$gene_symbol %in% sig_gene_symbols)
+  
+  # Create long format data for plotting
+  violin_data <- normalized_counts[gene_indices, , drop = FALSE] %>%
+    as.data.frame() %>%
+    tibble::rownames_to_column("ensembl_id") %>%
+    dplyr::mutate(gene_symbol = mcols(dds)$gene_symbol[gene_indices]) %>%
+    tidyr::pivot_longer(
+      cols = -c(ensembl_id, gene_symbol), 
+      names_to = "sample_id", 
+      values_to = "normalized_count"
+    ) %>%
+    dplyr::left_join(
+      as.data.frame(colData(dds)) %>%
+        tibble::rownames_to_column("sample_id") %>%
+        dplyr::select(sample_id, condition),
+      by = "sample_id"
+    ) %>%
+    dplyr::mutate(
+      log2_count = log2(normalized_count + 1),
+      condition = factor(condition, levels = c("Normal", "Tumor"))
+    ) %>%
+    dplyr::left_join(
+      significant_genes %>% dplyr::select(gene_symbol, direction, log2FoldChange),
+      by = "gene_symbol"
+    ) %>%
+    dplyr::mutate(gene_symbol = reorder(gene_symbol, log2FoldChange))
+  
+  # Create violin plot
+  violin_plot <- violin_data %>%
+    ggplot(aes(x = condition, y = log2_count, fill = condition)) +
+    geom_violin(alpha = 0.7, trim = FALSE) +
+    geom_boxplot(width = 0.1, alpha = 0.8, outlier.shape = NA) +
+    geom_jitter(width = 0.2, alpha = 0.4, size = 0.8) +
+    scale_fill_manual(
+      values = c("Normal" = "steelblue", "Tumor" = "firebrick"),
+      name = "Condition"
+    ) +
+    facet_wrap(~ gene_symbol, scales = "free_y", ncol = 3) +
+    theme_publication() +
+    theme(
+      strip.text = element_text(face = "bold", size = 10),
+      axis.text.x = element_text(angle = 45, hjust = 1),
+      legend.position = "top"
+    ) +
+    labs(
+      title = "Significantly changed phosphatases-related genes",
+      x = "Condition",
+      y = "Expression (log2(count + 1))"
+    )
+  
+violin_plot
+} else {
+  cat("No significantly changed phosphatases-related genes found.\n")
+}
+# store results for the csv
+significant_genes_paad <- significant_genes %>%
+  dplyr::mutate(
+    percent_change = 100 * (2^log2FoldChange - 1),
+    cancer = "PAAD"
+  ) %>%
+  dplyr::select(cancer, gene_symbol, log2FoldChange, padj, percent_change)
+```
+
+```{r}
+## ================
+## COAD (Colorectal)
+## ================
+
+dds <- analyses$Colorectal$dds
+results_df <- analyses$Colorectal$results
+
+cat("  Total samples:", ncol(dds), "\n")
+cat("  Normal samples:", sum(dds$condition == "Normal"), "\n")
+cat("  Tumor samples:", sum(dds$condition == "Tumor"), "\n")
+cat("  Total genes:", nrow(dds), "\n")
+
+vsd <- vst(dds, blind = FALSE)
+pca_data <- plotPCA(vsd, intgroup = "condition", returnData = TRUE) |>
+  as_tibble() |>
+  mutate(sample_id = name, condition = factor(group))
+percent_var <- round(100 * attr(plotPCA(vsd, intgroup = "condition", returnData = TRUE), "percentVar"))
+
+pc1_test <- t.test(PC1 ~ condition, data = pca_data)
+pc2_test <- t.test(PC2 ~ condition, data = pca_data)
+cat("PCA Results:\n")
+cat("  PC1 variance explained:", percent_var[1], "%\n")
+cat("  PC2 variance explained:", percent_var[2], "%\n")
+cat("  PC1 separation p-value:", format.pval(pc1_test$p.value), "\n")
+cat("  PC2 separation p-value:", format.pval(pc2_test$p.value), "\n")
+
+pca_colorectal <- ggplot(pca_data, aes(x = PC1, y = PC2, color = condition)) +
+  geom_point(size = 3, alpha = 0.8) +
+  stat_ellipse(aes(group = condition), type = "norm", level = 0.68, alpha = 0.3) +
+  scale_color_manual(values = c("Normal" = "steelblue", "Tumor" = "firebrick"), name = "Condition") +
+  theme_publication() +
+  labs(title = "PCA - COAD", x = paste0("PC1 (", percent_var[1], "%)"), y = paste0("PC2 (", percent_var[2], "%)"))
+pca_colorectal
+
+volcano_data <- as.data.frame(results_df) |>
+  as_tibble(rownames = "ensembl_id") |>
+  mutate(gene_symbol = mcols(dds)$gene_symbol) |>
+  filter(!is.na(padj), !is.na(log2FoldChange)) |>
+  mutate(
+    neg_log10_padj = -log10(padj),
+    is_gene_interest = gene_symbol %in% genes_of_interest,
+    significance = case_when(
+      is_gene_interest ~ "Genes of Interest",
+      padj < 0.05 & log2FoldChange >  1 ~ "Upregulated",
+      padj < 0.05 & log2FoldChange < -1 ~ "Downregulated",
+      .default = "Not significant"
+    )
+  )
+cat("Volcano plot data:", nrow(volcano_data), "genes\n")
+
+volcano_all_colorectal <- ggplot(volcano_data, aes(x = log2FoldChange, y = neg_log10_padj)) +
+  geom_point(data = filter(volcano_data, !is_gene_interest), aes(color = significance), alpha = 0.4, size = 0.8) +
+  geom_point(data = filter(volcano_data,  is_gene_interest), color = "orange", size = 3, alpha = 0.9) +
+  scale_color_manual(values = c("Upregulated" = "firebrick", "Downregulated" = "steelblue", "Not significant" = "grey"), name = "Regulation") +
+  geom_hline(yintercept = -log10(0.05), linetype = "dashed", alpha = 0.7) +
+  geom_vline(xintercept = c(-1, 1), linetype = "dashed", alpha = 0.7) +
+  geom_text_repel(data = filter(volcano_data, is_gene_interest), aes(label = gene_symbol), size = 3, max.overlaps = 20, box.padding = 0.3) +
+  theme_publication() +
+  labs(title = "Differential expression - COAD", x = "Log2FC (Tumor vs Normal)", y = "-Log10(padj)")
+volcano_all_colorectal
+
+volcano_pp2a_data <- volcano_data |>
+  filter(gene_symbol %in% genes_of_interest) |>
+  mutate(
+    significance_category = ifelse(abs(log2FoldChange) > 1 & padj < 0.05, "Significant", "Not Significant"),
+    direction = case_when(
+      log2FoldChange >  1 & padj < 0.05 ~ "Upregulated",
+      log2FoldChange < -1 & padj < 0.05 ~ "Downregulated",
+      TRUE ~ "Not Significant"
+    )
+  )
+
+volcano_pp2a_colorectal <- ggplot(volcano_pp2a_data, aes(x = log2FoldChange, y = neg_log10_padj, color = direction)) +
+  geom_point(size = 4, alpha = 0.8) +
+  scale_color_manual(values = c("Upregulated" = "firebrick", "Downregulated" = "steelblue", "Not Significant" = "grey"), name = "Status") +
+  geom_hline(yintercept = -log10(0.05), linetype = "dashed", alpha = 0.7) +
+  geom_vline(xintercept = c(-1, 1), linetype = "dashed", alpha = 0.7) +
+  geom_text_repel(aes(label = gene_symbol), size = 3.5, max.overlaps = 20) +
+  theme_publication() +
+  labs(title = "Phosphatases-related genes - COAD", x = "Log2FC (Tumor vs Normal)", y = "-Log10(padj)")
+volcano_pp2a_colorectal
+
+# Violin plot for significantly changed genes 
+significant_genes <- volcano_pp2a_data %>%
+  dplyr::filter(abs(log2FoldChange) > 1, padj < 0.05) %>%
+  dplyr::arrange(log2FoldChange)
+
+if (nrow(significant_genes) > 0) {
+  print(significant_genes[, c("gene_symbol", "log2FoldChange", "padj", "direction")])
+  
+# Get normalized counts
+  normalized_counts <- counts(dds, normalized = TRUE)
+  
+# Extract data for significant genes
+  sig_gene_symbols <- significant_genes$gene_symbol
+  gene_indices <- which(mcols(dds)$gene_symbol %in% sig_gene_symbols)
+  
+# Create long format data for plotting
+  violin_data <- normalized_counts[gene_indices, , drop = FALSE] %>%
+    as.data.frame() %>%
+    tibble::rownames_to_column("ensembl_id") %>%
+    dplyr::mutate(gene_symbol = mcols(dds)$gene_symbol[gene_indices]) %>%
+    tidyr::pivot_longer(
+      cols = -c(ensembl_id, gene_symbol), 
+      names_to = "sample_name", 
+      values_to = "normalized_count"
+    ) %>%
+    dplyr::left_join(
+      as.data.frame(colData(dds)) %>%
+        tibble::rownames_to_column("sample_name") %>%
+        dplyr::select(sample_name, condition),
+      by = "sample_name"
+    ) %>%
+    dplyr::mutate(
+      log2_count = log2(normalized_count + 1),
+      condition = factor(condition, levels = c("Normal", "Tumor"))
+    ) %>%
+    dplyr::left_join(
+      significant_genes %>% dplyr::select(gene_symbol, direction, log2FoldChange),
+      by = "gene_symbol"
+    ) %>%
+    dplyr::mutate(gene_symbol = reorder(gene_symbol, log2FoldChange))
+  
+# Create violin plot
+  violin_colorectal <- violin_data %>%
+    ggplot(aes(x = condition, y = log2_count, fill = condition)) +
+    geom_violin(alpha = 0.7, trim = FALSE) +
+    geom_boxplot(width = 0.1, alpha = 0.8, outlier.shape = NA) +
+    geom_jitter(width = 0.2, alpha = 0.4, size = 0.8) +
+    scale_fill_manual(
+      values = c("Normal" = "steelblue", "Tumor" = "firebrick"),
+      name = "Condition"
+    ) +
+    facet_wrap(~ gene_symbol, scales = "free_y", ncol = 3) +
+    theme_publication() +
+    theme(
+      strip.text = element_text(face = "bold", size = 10),
+      axis.text.x = element_text(angle = 45, hjust = 1),
+      legend.position = "top"
+    ) +
+    labs(
+      title = "Significantly changed phosphatases-related genes - COAD",
+      x = "Condition",
+      y = "Expression (log2(count + 1))"
+    )
+violin_colorectal
+} else {
+  cat("No significantly changed phosphatases-related genes found in COAD\n")
+}
+# store results for the csv
+significant_genes_coad <- significant_genes %>%
+  dplyr::mutate(
+    percent_change = 100 * (2^log2FoldChange - 1),
+    cancer = "COAD"
+  ) %>%
+  dplyr::select(cancer, gene_symbol, log2FoldChange, padj, percent_change)
+```
+
+```{r}
+## ============
+## LUAD (Lung)
+## ============
+
+dds <- analyses$Lung$dds
+results_df <- analyses$Lung$results
+
+cat("  Total samples:", ncol(dds), "\n")
+cat("  Normal samples:", sum(dds$condition == "Normal"), "\n")
+cat("  Tumor samples:", sum(dds$condition == "Tumor"), "\n")
+cat("  Total genes:", nrow(dds), "\n")
+
+vsd <- vst(dds, blind = FALSE)
+pca_data <- plotPCA(vsd, intgroup = "condition", returnData = TRUE) |>
+  as_tibble() |>
+  mutate(sample_id = name, condition = factor(group))
+percent_var <- round(100 * attr(plotPCA(vsd, intgroup = "condition", returnData = TRUE), "percentVar"))
+
+pc1_test <- t.test(PC1 ~ condition, data = pca_data)
+pc2_test <- t.test(PC2 ~ condition, data = pca_data)
+cat("PCA Results:\n")
+cat("  PC1 variance explained:", percent_var[1], "%\n")
+cat("  PC2 variance explained:", percent_var[2], "%\n")
+cat("  PC1 separation p-value:", format.pval(pc1_test$p.value), "\n")
+cat("  PC2 separation p-value:", format.pval(pc2_test$p.value), "\n")
+
+pca_lung <- ggplot(pca_data, aes(x = PC1, y = PC2, color = condition)) +
+  geom_point(size = 3, alpha = 0.8) +
+  stat_ellipse(aes(group = condition), type = "norm", level = 0.68, alpha = 0.3) +
+  scale_color_manual(values = c("Normal" = "steelblue", "Tumor" = "firebrick"), name = "Condition") +
+  theme_publication() +
+  labs(title = "PCA - LUAD", x = paste0("PC1 (", percent_var[1], "%)"), y = paste0("PC2 (", percent_var[2], "%)"))
+pca_lung
+
+volcano_data <- as.data.frame(results_df) |>
+  as_tibble(rownames = "ensembl_id") |>
+  mutate(gene_symbol = mcols(dds)$gene_symbol) |>
+  filter(!is.na(padj), !is.na(log2FoldChange)) |>
+  mutate(
+    neg_log10_padj = -log10(padj),
+    is_gene_interest = gene_symbol %in% genes_of_interest,
+    significance = case_when(
+      is_gene_interest ~ "Genes of Interest",
+      padj < 0.05 & log2FoldChange >  1 ~ "Upregulated",
+      padj < 0.05 & log2FoldChange < -1 ~ "Downregulated",
+      .default = "Not significant"
+    )
+  )
+cat("Volcano plot data:", nrow(volcano_data), "genes\n")
+
+volcano_all_lung <- ggplot(volcano_data, aes(x = log2FoldChange, y = neg_log10_padj)) +
+  geom_point(data = filter(volcano_data, !is_gene_interest), aes(color = significance), alpha = 0.4, size = 0.8) +
+  geom_point(data = filter(volcano_data,  is_gene_interest), color = "orange", size = 3, alpha = 0.9) +
+  scale_color_manual(values = c("Upregulated" = "firebrick", "Downregulated" = "steelblue", "Not significant" = "grey"), name = "Regulation") +
+  geom_hline(yintercept = -log10(0.05), linetype = "dashed", alpha = 0.7) +
+  geom_vline(xintercept = c(-1, 1), linetype = "dashed", alpha = 0.7) +
+  geom_text_repel(data = filter(volcano_data, is_gene_interest), aes(label = gene_symbol), size = 3, max.overlaps = 20, box.padding = 0.3) +
+  theme_publication() +
+  labs(title = "Differential expression - LUAD", x = "Log2FC (Tumor vs Normal)", y = "-Log10(padj)")
+volcano_all_lung
+
+volcano_pp2a_data <- volcano_data |>
+  filter(gene_symbol %in% genes_of_interest) |>
+  mutate(
+    significance_category = ifelse(abs(log2FoldChange) > 1 & padj < 0.05, "Significant", "Not Significant"),
+    direction = case_when(
+      log2FoldChange >  1 & padj < 0.05 ~ "Upregulated",
+      log2FoldChange < -1 & padj < 0.05 ~ "Downregulated",
+      TRUE ~ "Not Significant"
+    )
+  )
+
+volcano_pp2a_lung <- ggplot(volcano_pp2a_data, aes(x = log2FoldChange, y = neg_log10_padj, color = direction)) +
+  geom_point(size = 4, alpha = 0.8) +
+  scale_color_manual(values = c("Upregulated" = "firebrick", "Downregulated" = "steelblue", "Not Significant" = "grey"), name = "Status") +
+  geom_hline(yintercept = -log10(0.05), linetype = "dashed", alpha = 0.7) +
+  geom_vline(xintercept = c(-1, 1), linetype = "dashed", alpha = 0.7) +
+  geom_text_repel(aes(label = gene_symbol), size = 3.5, max.overlaps = 20) +
+  theme_publication() +
+  labs(title = "Phosphatases-related genes - LUAD", x = "Log2FC (Tumor vs Normal)", y = "-Log10(padj)")
+volcano_pp2a_lung
+
+# Violin plot for significantly changed genes - LUAD
+significant_genes <- volcano_pp2a_data %>%
+  dplyr::filter(abs(log2FoldChange) > 1, padj < 0.05) %>%
+  dplyr::arrange(log2FoldChange)
+
+if (nrow(significant_genes) > 0) {
+  print(significant_genes[, c("gene_symbol", "log2FoldChange", "padj", "direction")])
+  
+  # Get normalized counts
+  normalized_counts <- counts(dds, normalized = TRUE)
+  
+  # Extract data for significant genes
+  sig_gene_symbols <- significant_genes$gene_symbol
+  gene_indices <- which(mcols(dds)$gene_symbol %in% sig_gene_symbols)
+  
+  # Create long format data for plotting
+  violin_data <- normalized_counts[gene_indices, , drop = FALSE] %>%
+    as.data.frame() %>%
+    tibble::rownames_to_column("ensembl_id") %>%
+    dplyr::mutate(gene_symbol = mcols(dds)$gene_symbol[gene_indices]) %>%
+    tidyr::pivot_longer(
+      cols = -c(ensembl_id, gene_symbol), 
+      names_to = "sample_name", 
+      values_to = "normalized_count"
+    ) %>%
+    dplyr::left_join(
+      as.data.frame(colData(dds)) %>%
+        tibble::rownames_to_column("sample_name") %>%
+        dplyr::select(sample_name, condition),
+      by = "sample_name"
+    ) %>%
+    dplyr::mutate(
+      log2_count = log2(normalized_count + 1),
+      condition = factor(condition, levels = c("Normal", "Tumor"))
+    ) %>%
+    dplyr::left_join(
+      significant_genes %>%
+        dplyr::select(gene_symbol, direction, log2FoldChange),
+      by = "gene_symbol"
+    ) %>%
+    dplyr::mutate(gene_symbol = reorder(gene_symbol, log2FoldChange))
+  
+  # Create violin plot
+  violin_lung <- violin_data %>%
+    ggplot(aes(x = condition, y = log2_count, fill = condition)) +
+    geom_violin(alpha = 0.7, trim = FALSE) +
+    geom_boxplot(width = 0.1, alpha = 0.8, outlier.shape = NA) +
+    geom_jitter(width = 0.2, alpha = 0.4, size = 0.8) +
+    scale_fill_manual(
+      values = c("Normal" = "steelblue", "Tumor" = "firebrick"),
+      name = "Condition"
+    ) +
+    facet_wrap(~ gene_symbol, scales = "free_y", ncol = 3) +
+    theme_publication() +
+    theme(
+      strip.text = element_text(face = "bold", size = 10),
+      axis.text.x = element_text(angle = 45, hjust = 1),
+      legend.position = "top"
+    ) +
+    labs(
+      title = "Significantly changed phosphatases-related genes - LUAD",
+      x = "Condition",
+      y = "Expression (log2(count + 1))"
+    )
+  
+  print(violin_lung)
+} else {
+  cat("No significantly changed phosphatases-related genes found in LUAD\n")
+}
+# store results for the csv
+significant_genes_luad <- significant_genes %>%
+  dplyr::mutate(
+    percent_change = 100 * (2^log2FoldChange - 1),
+    cancer = "LUAD"
+  ) %>%
+  dplyr::select(cancer, gene_symbol, log2FoldChange, padj, percent_change)
+```
+
+```{r}
+## ==========================
+## Export combined hit table
+## ==========================
+
+significant_genes_all <- dplyr::bind_rows(
+  significant_genes_paad,
+  significant_genes_coad,
+  significant_genes_luad
+)
+
+readr::write_csv(significant_genes_all, file.path(results_path, "significant_genes_bulk.csv"))
+
+# Optional: session info for reproducibility
+sessionInfo()
+```
