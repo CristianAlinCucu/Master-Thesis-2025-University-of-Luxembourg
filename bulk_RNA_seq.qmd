@@ -75,7 +75,7 @@ dir.create(results_path, recursive = TRUE, showWarnings = FALSE)
 # Genes of interest
 genes_of_interest <- c(
   "PPP2CA","PPP2CB",                    # Catalytic subunits
-  "PPP2R5A","PPP2R5D","STRN",           # PP2A regulatory subunits
+  "PPP2R5A","PPP2R2D","STRN",           # PP2A regulatory subunits
   "CIP2A","SET","ANP32A","ANP32B",      # PP2A-B56 inhibitors
   "MASTL","ENSA","ARPP19",              # PP2A-B55 inhibitors
   "LCMT1","PPME1",                      # PP2A methyl/methylesterase
@@ -755,3 +755,4 @@ readr::write_csv(significant_genes_all, file.path(results_path, "significant_gen
 # Optional: session info for reproducibility
 sessionInfo()
 ```
+
